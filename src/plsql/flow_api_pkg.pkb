@@ -622,6 +622,7 @@ is
   l_target_objt_sub      flow_objects.objt_type%TYPE; --target object in subprocess
   l_num_back_connections    number;   -- number of connections leading into object
   l_num_forward_connections number;   -- number of connections forward from object
+  l_path_count              number;   -- used to count paths taken (eventGateway)
   l_num_unfinished_subflows    number;
   l_gateway_forward_status varchar2(10);
 begin
@@ -735,8 +736,15 @@ begin
         ;
     when 'bpmn:exclusiveGateway'
     then
-        -- handles opening and closing (but not combined)
+        -- handles opening and closing and closing&reopening
         apex_debug.message(p_message => 'Next Step is exclusiveGateway '||l_conn_target_ref, p_level => 4) ;
+        -- first check if this is a closing gateway with only one forward path.  If so, skip to next step.
+        select count(*)
+          into l_num_forward_connections
+          from flow_connections conn 
+         where conn.conn_src_objt_id = l_conn_tgt_objt_id
+           and conn.conn_dgrm_id = l_dgrm_id
+        ;
         update flow_subflows sbfl
            set sbfl.sbfl_current = l_conn_target_ref
              , sbfl.sbfl_last_completed = l_sbfl_last_completed
@@ -745,7 +753,115 @@ begin
         where sbfl.sbfl_id = p_subflow_id
           and sbfl.sbfl_prcs_id = p_process_id
         ;      
-    when 'bpmn:parallelGateway'
+        if l_num_forward_connections = 1
+        then
+            -- only one forward path.  don't stop - do next step.
+            flow_next_step 
+                ( p_process_id => p_process_id
+                , p_subflow_id => p_subflow_id
+                , p_forward_route => null
+                );
+        end if;
+    when 'bpmn:inclusiveGateway'
+    then
+        -- handles opening and closing but not closing&reopening
+        apex_debug.message(p_message => 'Next Step is inclusiveGateway '||l_conn_target_ref, p_level => 4) ;
+         -- test if this is splitting or merging (or both) gateway
+        select count(*)
+          into l_num_back_connections
+          from flow_connections conn 
+         where conn.conn_tgt_objt_id = l_conn_tgt_objt_id
+           and conn.conn_dgrm_id = l_dgrm_id
+        ;
+        select count(*)
+          into l_num_forward_connections
+          from flow_connections conn 
+         where conn.conn_src_objt_id = l_conn_tgt_objt_id
+           and conn.conn_dgrm_id = l_dgrm_id
+        ;
+        if l_num_back_connections = 1
+        then
+            -- this is opening inclusiveGateway.  Step into it.  Forward paths will get opened by flow_next_step
+            -- after user decision.
+           update flow_subflows sbfl
+              set sbfl.sbfl_current = l_conn_target_ref
+                , sbfl.sbfl_last_completed = l_sbfl_last_completed
+                , sbfl.sbfl_last_update = sysdate
+                , sbfl.sbfl_status = 'running'
+            where sbfl.sbfl_id = p_subflow_id
+              and sbfl.sbfl_prcs_id = p_process_id
+            ;  
+        elsif (l_num_back_connections > 1 AND l_num_forward_connections >1)
+        then
+            -- diagram has closing and re-opening inclusiveGateway which is not supported
+            apex_error.add_error
+                ( p_message => 'Inclusive Gateway with multiple inputs and multiple outputs not supported.  Re-draw as two gateways.'
+                , p_display_location => apex_error.c_on_error_page
+                );
+        elsif (l_num_forward_connections = 1 AND l_num_back_connections >1)
+        then
+            -- merging gateway.  
+            -- note actual number of subflows could be 1 or more & not all possible 
+            -- forward paths from the diagram may have been started.  So always work on running subflows
+            -- not connections from the diagram.
+            apex_debug.message(p_message => 'Merging Inclusive Gateway'||l_conn_target_ref, p_level => 4) ;       
+
+            -- set current subflow to status waiting,       
+            update flow_subflows sbfl
+              set sbfl.sbfl_status = 'waiting at gateway'
+                , sbfl.sbfl_last_update = sysdate 
+                , sbfl.sbfl_current = l_conn_target_ref
+            where sbfl.sbfl_id = p_subflow_id
+              and sbfl.sbfl_prcs_id = p_process_id
+            ;
+            -- check if we are waiting for other flows or can proceed
+            select count(*)
+              into l_num_unfinished_subflows
+              from flow_subflows sbfl
+            where sbfl.sbfl_prcs_id = p_process_id
+              and sbfl.sbfl_starting_object = l_sbfl_starting_object
+              and ( sbfl.sbfl_current != l_conn_target_ref
+                  or sbfl.sbfl_status != 'waiting at gateway' )
+                ;
+            if l_num_unfinished_subflows = 0 then
+                -- all merging tasks completed.  proceed from gateway
+                for completed_subflows in (
+                  select sbfl.sbfl_id
+                    from flow_subflows sbfl 
+                    where sbfl.sbfl_prcs_id = p_process_id
+                      and sbfl.sbfl_starting_object = l_sbfl_starting_object
+                      and sbfl.sbfl_current = l_conn_target_ref 
+                      and sbfl.sbfl_status = 'waiting at gateway'
+                )
+                loop
+                  subflow_complete
+                  ( p_process_id => p_process_id
+                  , p_subflow_id => completed_subflows.sbfl_id
+                  );
+                end loop;     
+                --log gateway object as complete
+      
+                -- switch to parent subflow
+                l_sbfl_id := l_sbfl_id_par;
+                --restart parent split subflow
+                update flow_subflows sbfl
+                  set sbfl.sbfl_last_completed = l_conn_target_ref
+                    , sbfl.sbfl_current = l_conn_target_ref
+                    , sbfl.sbfl_status = 'running'
+                    , sbfl.sbfl_last_update = sysdate
+                where sbfl.sbfl_last_completed = l_sbfl_starting_object
+                  and sbfl.sbfl_status = 'split'
+                  and sbfl.sbfl_id = l_sbfl_id_par
+                ;
+                -- step into first step on the new path
+                flow_next_step 
+                ( p_process_id => p_process_id
+                , p_subflow_id => l_sbfl_id
+                , p_forward_route => null
+                );
+            end if;    -- merging finished      
+        end if;  -- operation type
+    when 'bpmn:parallelGateway' 
     then
         apex_debug.message(p_message => 'Next Step is parallelGateway '||l_conn_target_ref, p_level => 4) ;
         -- test if this is splitting or merging (or both) gateway
@@ -821,8 +937,8 @@ begin
         end if;
         -- now do forward path, if you have token to 'proceed'
         if l_gateway_forward_status = 'proceed' then 
-        if l_num_forward_connections > 1
-        then
+          if l_num_forward_connections > 1
+          then
             -- we have splitting gateway going forward
             begin
             -- get all forward parallel paths and create subflows for them
@@ -867,7 +983,7 @@ begin
                 ( p_message => 'No forward paths found for opening Parallel Gateway'
                 , p_display_location => apex_error.c_on_error_page
                 );
-              when too_many_rows then
+              when too_many_rows then  -- is this necessary?
                 apex_error.add_error
                 ( p_message => 'Too many forward paths found  opening Parallel Gateway'
                 , p_display_location => apex_error.c_on_error_page
@@ -889,8 +1005,8 @@ begin
             , p_subflow_id => l_sbfl_id
             , p_forward_route => null
             );
-        end if;  -- single path
-      end if;  -- forward token
+          end if;  -- single path
+        end if;  -- forward token
     when 'bpmn:subProcess' then
       apex_debug.message(p_message => 'Next Step is subProcess start '||l_conn_target_ref, p_level => 4) ;   
       -- find subProcess startEvent
@@ -940,6 +1056,81 @@ begin
       where sbfl.sbfl_id = p_subflow_id
         and sbfl.sbfl_prcs_id = p_process_id
       ;  
+    when 'bpmn:eventBasedGateway'
+    then
+        -- eventGateway can have multiple inputs and outputs, but there is no waiting, etc.
+        -- incoming subflow continues on the first output path.
+        -- additional output paths create new subflows
+        apex_debug.message(p_message => 'Next Step is eventGateway '||l_conn_target_ref, p_level => 4) ;
+        begin
+            -- get all forward parallel paths and create subflows for them
+            -- these are paths forward of l_conn_target_ref as we are doing double step
+            l_path_count := 1;
+            for new_path in (
+                select conn.conn_bpmn_id route
+                     , objt.objt_bpmn_id target
+                  from flow_connections conn
+                  join flow_objects objt
+                    on objt.objt_id = conn.conn_tgt_objt_id
+                 where conn.conn_dgrm_id = l_dgrm_id
+                   and conn.conn_src_objt_id = l_conn_tgt_objt_id
+            )
+            loop
+                if l_path_count = 1
+                then
+                    -- continue to use existing subflow
+                    update flow_subflows sbfl
+                      set sbfl.sbfl_last_completed = l_sbfl_current
+                        , sbfl.sbfl_current = l_conn_target_ref
+                        , sbfl.sbfl_status = 'running'
+                        , sbfl.sbfl_last_update = sysdate 
+                    where sbfl.sbfl_id = p_subflow_id
+                      and sbfl.sbfl_prcs_id = p_process_id
+                        ;
+                    l_sbfl_id_sub := p_subflow_id;
+                else 
+                    -- create new subflows for additional forward paths starting here
+                    l_sbfl_id_sub := subflow_start
+                        ( p_process_id =>  p_process_id         
+                        , p_parent_subflow =>  l_sbfl_id        
+                        , p_starting_object =>  l_conn_target_ref         
+                        , p_current_object => l_conn_target_ref          
+                        , p_route =>  new_path.route         
+                        , p_last_completed =>  l_conn_target_ref        
+                        );
+                end if;
+                  -- step into first step on the new path
+                flow_next_step 
+                      (p_process_id => p_process_id
+                      ,p_subflow_id => l_sbfl_id_sub
+                      ,p_forward_route => new_path.route
+                      );
+                l_path_count := l_path_count + 1;
+            end loop;
+        exception
+              when no_data_found then
+                apex_error.add_error
+                ( p_message => 'No forward paths found for event Gateway'
+                , p_display_location => apex_error.c_on_error_page
+                );
+        end;
+    when  'bpmn:intermediateCatchEvent' --- next step is a simple activity / task
+    then 
+        -- then we make everything behave like a simple activity unless specifically supported
+        -- currently only supports timer & without checking its type is timer
+        -- but this will have a case type = timer, emailReceive. ....
+        -- this is currently just a stub.
+        apex_debug.message(p_message => 'Next Step is IntermediateCatchEvent '||l_conn_target_ref, p_level => 4) ;
+        update flow_subflows sbfl
+        set   sbfl.sbfl_current = l_conn_target_ref
+            , sbfl.sbfl_last_completed = l_sbfl_last_completed
+            , sbfl.sbfl_last_update = sysdate
+ --           , sbfl.sbfl_status = 'waiting for timer'
+            , sbfl.sbfl_status = 'running'
+        where sbfl.sbfl_id = p_subflow_id
+          and sbfl.sbfl_prcs_id = p_process_id
+        ;
+    end case;
     when  'bpmn:task' --- next step is a simple activity / task
     then 
         -- should this be when others?  
@@ -955,7 +1146,6 @@ begin
           and sbfl.sbfl_prcs_id = p_process_id
         ;
     end case;
-
   exception
     when TOO_MANY_ROWS
     then
@@ -971,7 +1161,6 @@ begin
       );
   end flow_next_step;
 
-
   procedure flow_next_branch
   ( p_process_id  in flow_processes.prcs_id%type
   , p_subflow_id in flow_subflows.sbfl_id%type
@@ -982,114 +1171,88 @@ begin
     l_conn_target_ref     flow_objects.objt_bpmn_id%type;
     l_conn_tgt_objt_id    flow_connections.conn_tgt_objt_id%type;
     l_sbfl_current        flow_subflows.sbfl_current%type;
+    l_sbfl_current_objt_id flow_objects.objt_id%type;
     l_current_tag_name    flow_objects.objt_tag_name%type;
     l_new_subflow         flow_subflows.sbfl_id%type;
   begin
     apex_debug.message(p_message => 'Begin flow_next_branch', p_level => 3) ;
     -- get diagram name and current state
+    apex_debug.info('p_BRANCH_NAME passed in :',p_branch_name);
     select prcs.prcs_dgrm_id
          , sbfl.sbfl_current
+         , objt.objt_tag_name
+         , objt.objt_id
       into l_dgrm_id
          , l_sbfl_current
-      from flow_subflows sbfl
-      join flow_processes prcs
+         , l_current_tag_name
+         , l_sbfl_current_objt_id
+      from flow_processes prcs
+      join flow_subflows sbfl
         on sbfl.sbfl_prcs_id = prcs.prcs_id
+      join flow_objects objt
+        on sbfl.sbfl_current = objt.objt_bpmn_id
+       and prcs.prcs_dgrm_id = objt_dgrm_id
      where sbfl.sbfl_prcs_id = p_process_id
        and sbfl.sbfl_id = p_subflow_id
-    ;
-    
-    --get current object tag type
-    select objt.objt_tag_name
-      into l_current_tag_name
-      from flow_objects objt
-     where objt.objt_bpmn_id = l_sbfl_current
-       and objt.objt_dgrm_id = l_dgrm_id
-    ;
+    ;  
     case l_current_tag_name 
-      when 'bpmn:exclusiveGateway' then
+    when 'bpmn:exclusiveGateway' then
       -- only only path chosen.  Keep existing subflow but switch to chosen path
-        begin
-
-          -- log current step as completed
-          log_step_completion
-          ( p_process_id => p_process_id
-          , p_subflow_id => p_subflow_id
-          , p_completed_object => l_sbfl_current
-          , p_notes => ''
-          );
-
-          select tgt_objt.objt_bpmn_id
-            into l_conn_target_ref
-            from flow_connections conn
-            join flow_objects tgt_objt
-              on tgt_objt.objt_id = conn.conn_tgt_objt_id
-            join flow_objects src_objt
-              on src_objt.objt_id = conn.conn_src_objt_id
-           where src_objt.objt_bpmn_id = l_sbfl_current
-             and conn.conn_dgrm_id = l_dgrm_id
-             and conn.conn_bpmn_id = p_branch_name
-          ;
-          -- possibly change this to call flow_next_step?
-          update flow_subflows sbfl
-          set   sbfl.sbfl_current = l_conn_target_ref
-              , sbfl.sbfl_last_completed = l_sbfl_current
-              , sbfl.sbfl_last_update = sysdate
-              , sbfl.sbfl_status = 'running'
-          where sbfl.sbfl_id  = p_subflow_id
-            and sbfl.sbfl_prcs_id = p_process_id
-              ;
-        exception
-        when NO_DATA_FOUND 
-        then
-            apex_error.add_error
-            ( p_message => 'No branch was found.'
-            , p_display_location => apex_error.c_on_error_page
-            );
-        end;
-    when 'bpmn:parallelGateway' then
-      apex_debug.message(p_message => 'Begin creating parallelFlows', p_level => 3) ;
+      -- step into first step on the chosen path
+      flow_next_step 
+        (p_process_id => p_process_id
+        ,p_subflow_id => p_subflow_id
+        ,p_forward_route => p_branch_name
+        );          
+    when 'bpmn:inclusiveGateway' then
+      apex_debug.message(p_message => 'Begin creating parallel flows for inclusiveGateway', p_level => 3) ;
+      -- get all forward parallel paths and create subflows for them if they are in forward path(s) chosen
+      -- these are paths forward of l_conn_target_ref as we are doing double step.
       begin
-        -- get all forward parallel paths and create subflows for them
         for new_path in (
-             select conn.conn_name route
-                  , tgt_objt.objt_bpmn_id target
-               from flow_connections conn
-               join flow_objects tgt_objt
-                 on tgt_objt.objt_id = conn.conn_tgt_objt_id
-               join flow_objects src_objt
-                 on src_objt.objt_id = conn.conn_src_objt_id
+            select conn.conn_bpmn_id route
+                  , objt.objt_bpmn_id target
+              from flow_connections conn
+              join flow_objects objt
+                on objt.objt_id = conn.conn_tgt_objt_id
               where conn.conn_dgrm_id = l_dgrm_id
-                and src_objt.objt_bpmn_id = l_sbfl_current
+                and conn.conn_src_objt_id = l_sbfl_current_objt_id
+                and conn.conn_bpmn_id in (select * from table(apex_string.split(':'||p_branch_name||':',':')))
         )
         loop
-          l_new_subflow := subflow_start
-          ( p_process_id =>  p_process_id         
-          , p_parent_subflow =>  p_subflow_id         
-          , p_starting_object =>  l_sbfl_current         
-          , p_current_object => new_path.target          
-          , p_route =>  new_path.route         
-          , p_last_completed =>  l_sbfl_current         
-          );
+              -- path is included in list of chosen forward paths.
+              apex_debug.message(p_message => 'starting parallel flow for inclusiveGateway', p_level => 3) ;
+              l_new_subflow := subflow_start
+                  ( p_process_id =>  p_process_id         
+                  , p_parent_subflow =>  p_subflow_id        
+                  , p_starting_object =>  l_sbfl_current        
+                  , p_current_object => l_sbfl_current          
+                  , p_route =>  new_path.route         
+                  , p_last_completed =>  l_sbfl_current        
+                  );
+              -- step into first step on the new path
+              flow_next_step 
+                  (p_process_id => p_process_id
+                  ,p_subflow_id => l_new_subflow
+                  ,p_forward_route => new_path.route
+                  );
         end loop;
+        -- set current subflow to status split, current = null       
+        update flow_subflows sbfl
+          set sbfl.sbfl_last_completed = l_sbfl_current
+            , sbfl.sbfl_current = ''
+            , sbfl.sbfl_status = 'split'
+            , sbfl.sbfl_last_update = sysdate 
+        where sbfl.sbfl_id = p_subflow_id
+          and sbfl.sbfl_prcs_id = p_process_id
+            ;
+      exception
+        when no_data_found then
+          apex_error.add_error
+          ( p_message => 'No forward paths found for opening Inclusive Gateway'
+          , p_display_location => apex_error.c_on_error_page
+          );
       end;
-          -- set current subflow to status split, current = null       
-          update flow_subflows sbfl
-             set sbfl.sbfl_last_completed = l_sbfl_current
-               , sbfl.sbfl_current = ''
-               , sbfl.sbfl_status = 'split'
-               , sbfl.sbfl_last_update = sysdate 
-           where sbfl.sbfl_id = p_subflow_id
-             and sbfl.sbfl_prcs_id = p_process_id
-               ;
-  
-      when 'bpmn:optionalGateway'
-    then
-          apex_debug.message(p_message => 'Begin creating optional Flows', p_level => 3) ;
-          -- to be implemented
-          -- parse returned branches list
-          -- step through all forward parallel paths
-             -- create subflow and initialise
-             -- set current subflow to status split, current = null
     end case;
   end flow_next_branch;
 
